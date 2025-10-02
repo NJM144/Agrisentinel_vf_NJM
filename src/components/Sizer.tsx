@@ -1,169 +1,214 @@
-import React, { useState, useEffect } from 'react';
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
-import { Button } from '@/components/ui/button';
-import { Label } from '@/components/ui/label';
-import { Slider } from '@/components/ui/slider';
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
-import { Badge } from '@/components/ui/badge';
-import { MapPin, Hexagon, Square } from 'lucide-react';
-import { generatePolygonFromPoint, calculateAreaHa } from '@/lib/geo';
+// src/components/Sizer.tsx
+import React, { useEffect, useMemo, useRef, useState } from "react";
+import { MapContainer, TileLayer, Marker, Popup, useMap } from "react-leaflet";
+import L from "leaflet";
+import "leaflet-draw";
+import type { Feature, Polygon as GJPolygon } from "geojson";
+import * as turf from "@turf/turf";
 
-interface SizerProps {
+// Ces deux libs n'ont pas toujours des types complets → any
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore
+import GeoTIFF from "geotiff";
+// eslint-disable-next-line @typescript-eslint/ban-ts-comment
+// @ts-ignore
+import GeoRasterLayer from "georaster-layer-for-leaflet";
+
+type Props = {
   lat: number;
   lon: number;
-  onPolygonGenerated: (polygon: GeoJSON.Feature<GeoJSON.Polygon>, area: number) => void;
-}
+  onPolygonGenerated: (polygon: GeoJSON.Feature<GeoJSON.Polygon>, areaHa: number) => void;
+};
 
-const Sizer: React.FC<SizerProps> = ({ lat, lon, onPolygonGenerated }) => {
-  const [surfaceHa, setSurfaceHa] = useState([2.0]);
-  const [shape, setShape] = useState<'hex' | 'square'>('hex');
-  const [generatedPolygon, setGeneratedPolygon] = useState<GeoJSON.Feature<GeoJSON.Polygon> | null>(null);
-  const [calculatedArea, setCalculatedArea] = useState<number>(0);
+// --- Classes NDVI (simple, client-side)
+const NDVI_CLASS = (ndvi: number) =>
+  ndvi === null || Number.isNaN(ndvi)
+    ? { name: "NoData", color: [0, 0, 0, 0] }
+    : ndvi < 0.25
+    ? { name: "Zone nue", color: [210, 180, 140, 180] } // #D2B48C
+    : ndvi < 0.60
+    ? { name: "Zone cultivée", color: [0, 255, 0, 180] } // #00FF00
+    : { name: "Zone forestière", color: [0, 100, 0, 200] }; // #006400
+
+/** Contrôles de dessin/édition via Leaflet.Draw */
+function DrawControls({
+  onFeature,
+}: {
+  onFeature: (f: Feature<GJPolygon>, areaHa: number) => void;
+}) {
+  const map = useMap();
+  const drawnRef = useRef<L.FeatureGroup | null>(null);
 
   useEffect(() => {
-    generatePolygon();
-  }, [lat, lon, surfaceHa[0], shape]);
+    if (!map) return;
 
-  const generatePolygon = () => {
-    try {
-      const polygon = generatePolygonFromPoint({
-        lat,
-        lon,
-        surfaceHa: surfaceHa[0],
-        shape
-      });
-      
-      const actualArea = calculateAreaHa(polygon);
-      
-      setGeneratedPolygon(polygon);
-      setCalculatedArea(actualArea);
-      onPolygonGenerated(polygon, actualArea);
-    } catch (error) {
-      console.error('Error generating polygon:', error);
+    if (!drawnRef.current) {
+      drawnRef.current = new L.FeatureGroup();
+      map.addLayer(drawnRef.current);
     }
-  };
 
-  const handleSurfaceChange = (value: number[]) => {
-    setSurfaceHa(value);
-  };
+    const drawControl = new (L.Control as any).Draw({
+      draw: {
+        polygon: { allowIntersection: false, showArea: true },
+        rectangle: { showArea: true },
+        marker: false,
+        polyline: false,
+        circle: false,
+        circlemarker: false,
+      },
+      edit: { featureGroup: drawnRef.current },
+    });
+    map.addControl(drawControl);
 
-  const handleShapeChange = (newShape: 'hex' | 'square') => {
-    setShape(newShape);
-  };
+    function handleCreated(e: any) {
+      drawnRef.current!.clearLayers();
+      const layer = e.layer as L.Polygon;
+      drawnRef.current!.addLayer(layer);
+      const gj = layer.toGeoJSON() as Feature<GJPolygon>;
+      const areaHa = turf.area(gj) / 10000.0;
+      onFeature(gj, areaHa);
+    }
+
+    function handleEdited(e: any) {
+      const layers = e.layers as L.FeatureGroup;
+      layers.eachLayer((layer: any) => {
+        const gj = (layer as L.Polygon).toGeoJSON() as Feature<GJPolygon>;
+        const areaHa = turf.area(gj) / 10000.0;
+        onFeature(gj, areaHa);
+      });
+    }
+
+    map.on(L.Draw.Event.CREATED, handleCreated);
+    map.on(L.Draw.Event.EDITED, handleEdited);
+
+    return () => {
+      map.off(L.Draw.Event.CREATED, handleCreated);
+      map.off(L.Draw.Event.EDITED, handleEdited);
+      map.removeControl(drawControl);
+      if (drawnRef.current) map.removeLayer(drawnRef.current);
+    };
+  }, [map, onFeature]);
+
+  return null;
+}
+
+/** Couche raster NDVI depuis un GeoTIFF servi par /public/tifs/<tifName> */
+function NDVIRaster({ tifName }: { tifName: string }) {
+  const map = useMap();
+  const rasterLayerRef = useRef<any>(null);
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        setLoading(true);
+
+        // 👉 import dynamique : évite les soucis de résolution Vite/Rollup avec georaster
+        const { default: parseGeoraster } = await import(
+          // Chemin du bundle UMD (plus fiable en build Netlify)
+          "georaster/dist/georaster.min.js"
+        );
+
+        const url = `/tifs/${tifName}`; // place ton fichier dans public/tifs/
+        const res = await fetch(url);
+        if (!res.ok) throw new Error(`GeoTIFF HTTP ${res.status}`);
+        const buf = await res.arrayBuffer();
+
+        const tiff = await GeoTIFF.fromArrayBuffer(buf);
+        const image = await tiff.getImage();
+        const rasters = await tiff.readRasters({ interleave: false });
+
+        // parseGeoraster accepte (rasters, image)
+        const georaster = await parseGeoraster(rasters, image);
+
+        // Essai indices Sentinel-2 (B4=red, B8=nir). Fallback si indisponible.
+        const redIdx = 4 - 1;
+        const nirIdx = 8 - 1;
+        const hasBand = (i: number) => georaster.values[i] !== undefined;
+        const iRed = hasBand(redIdx) ? redIdx : 0;
+        const iNir = hasBand(nirIdx) ? nirIdx : Math.min(georaster.values.length - 1, 0);
+
+        if (rasterLayerRef.current) {
+          map.removeLayer(rasterLayerRef.current);
+          rasterLayerRef.current = null;
+        }
+
+        const layer = new (GeoRasterLayer as any)({
+          georaster,
+          resolution: 64, // augmenter pour qualité (plus lent), baisser pour perf
+          pixelValuesToColorFn: (values: number[]) => {
+            const red = values[iRed];
+            const nir = values[iNir];
+            if (red == null || nir == null) return "rgba(0,0,0,0)";
+            const ndvi = (nir - red) / (nir + red + 1e-6);
+            const { color } = NDVI_CLASS(ndvi);
+            return `rgba(${color[0]},${color[1]},${color[2]},${(color[3] ?? 255) / 255})`;
+          },
+          opacity: 0.6,
+        });
+
+        layer.addTo(map);
+        rasterLayerRef.current = layer;
+
+        const bounds = layer.getBounds?.();
+        if (bounds) map.fitBounds(bounds, { maxZoom: 17 });
+      } catch (e) {
+        console.error("GeoTIFF/NDVI error:", e);
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      if (rasterLayerRef.current) {
+        map.removeLayer(rasterLayerRef.current);
+        rasterLayerRef.current = null;
+      }
+    };
+  }, [map, tifName]);
 
   return (
-    <Card className="w-full">
-      <CardHeader>
-        <CardTitle className="flex items-center">
-          <MapPin className="h-5 w-5 mr-2 text-green-600" />
-          Générateur de Parcelle (Sizer)
-        </CardTitle>
-        <CardDescription>
-          Créez automatiquement un polygone à partir d'un point GPS
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="space-y-6">
-        {/* GPS Coordinates */}
-        <div className="grid grid-cols-2 gap-4">
-          <div>
-            <Label className="text-sm font-medium">Latitude</Label>
-            <div className="mt-1 p-2 bg-gray-50 rounded-md text-sm font-mono">
-              {lat.toFixed(6)}°
-            </div>
-          </div>
-          <div>
-            <Label className="text-sm font-medium">Longitude</Label>
-            <div className="mt-1 p-2 bg-gray-50 rounded-md text-sm font-mono">
-              {lon.toFixed(6)}°
-            </div>
-          </div>
-        </div>
+    <div className="absolute left-2 top-2 z-[1000] bg-white/90 rounded px-2 py-1 text-xs">
+      NDVI client-side {loading ? "…chargement" : ""}
+    </div>
+  );
+}
 
-        {/* Shape Selection */}
-        <div>
-          <Label className="text-sm font-medium mb-3 block">Forme du polygone</Label>
-          <div className="grid grid-cols-2 gap-3">
-            <Button
-              variant={shape === 'hex' ? 'default' : 'outline'}
-              onClick={() => handleShapeChange('hex')}
-              className="h-16 flex flex-col items-center justify-center"
-            >
-              <Hexagon className="h-6 w-6 mb-1" />
-              <span className="text-xs">Hexagone</span>
-            </Button>
-            <Button
-              variant={shape === 'square' ? 'default' : 'outline'}
-              onClick={() => handleShapeChange('square')}
-              className="h-16 flex flex-col items-center justify-center"
-            >
-              <Square className="h-6 w-6 mb-1" />
-              <span className="text-xs">Carré</span>
-            </Button>
-          </div>
-        </div>
+const Sizer: React.FC<Props> = ({ lat, lon, onPolygonGenerated }) => {
+  const center = useMemo(() => [lat, lon] as [number, number], [lat, lon]);
 
-        {/* Surface Adjustment */}
-        <div>
-          <div className="flex justify-between items-center mb-3">
-            <Label className="text-sm font-medium">Surface cible</Label>
-            <Badge variant="outline">
-              {surfaceHa[0].toFixed(1)} ha
-            </Badge>
-          </div>
-          <Slider
-            value={surfaceHa}
-            onValueChange={handleSurfaceChange}
-            min={0.1}
-            max={20}
-            step={0.1}
-            className="w-full"
-          />
-          <div className="flex justify-between text-xs text-gray-500 mt-1">
-            <span>0.1 ha</span>
-            <span>20 ha</span>
-          </div>
-        </div>
+  // Tu peux remplacer par un Select si plusieurs tiffs :
+  const tifName = "s2_Cocoa_ID_bssI9w_2024_01.tif";
 
-        {/* Generated Polygon Info */}
-        {generatedPolygon && (
-          <div className="bg-green-50 border border-green-200 rounded-lg p-4">
-            <h4 className="font-medium text-green-900 mb-2">Polygone généré</h4>
-            <div className="grid grid-cols-2 gap-4 text-sm">
-              <div>
-                <span className="text-green-700">Surface calculée:</span>
-                <div className="font-medium text-green-900">
-                  {calculatedArea.toFixed(2)} ha
-                </div>
-              </div>
-              <div>
-                <span className="text-green-700">Nombre de sommets:</span>
-                <div className="font-medium text-green-900">
-                  {generatedPolygon.geometry.coordinates[0].length - 1}
-                </div>
-              </div>
-            </div>
-            
-            {Math.abs(calculatedArea - surfaceHa[0]) > 0.1 && (
-              <div className="mt-2 text-xs text-green-700">
-                <strong>Note:</strong> La surface calculée peut légèrement différer de la surface cible 
-                en raison de la projection géographique.
-              </div>
-            )}
-          </div>
-        )}
+  return (
+    <div className="w-full">
+      <MapContainer center={center} zoom={15} className="w-full h-[500px]">
+        {/* Fond OSM libre */}
+        <TileLayer
+          url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          attribution="&copy; OpenStreetMap contributors"
+        />
 
-        {/* Usage Instructions */}
-        <div className="bg-blue-50 border border-blue-200 rounded-lg p-4">
-          <h4 className="font-medium text-blue-900 mb-2">Comment ça marche ?</h4>
-          <ul className="text-sm text-blue-800 space-y-1">
-            <li>• Le Sizer génère automatiquement un polygone régulier</li>
-            <li>• Ajustez la surface avec le curseur</li>
-            <li>• Choisissez entre hexagone (recommandé) ou carré</li>
-            <li>• Le polygone est centré sur le point GPS fourni</li>
-          </ul>
-        </div>
-      </CardContent>
-    </Card>
+        {/* Marqueur au centre saisi */}
+        <Marker position={center}>
+          <Popup>Centre ({lat.toFixed(5)}, {lon.toFixed(5)})</Popup>
+        </Marker>
+
+        {/* Couche raster NDVI colorisée à partir du GeoTIFF */}
+        <NDVIRaster tifName={tifName} />
+
+        {/* Outils de dessin/édition → remontent polygon + areaHa */}
+        <DrawControls
+          onFeature={(f, areaHa) => onPolygonGenerated(f as any, areaHa)}
+        />
+      </MapContainer>
+
+      <p className="mt-2 text-xs text-gray-500">
+        Dessine un polygone (outil en haut à gauche) sur la zone à enregistrer.
+      </p>
+    </div>
   );
 };
 
